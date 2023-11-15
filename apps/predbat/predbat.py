@@ -417,10 +417,7 @@ class Inverter:
             self.self_test(minutes_now)
         exit
 
-    def __init__(self, base, id=0, quiet=False):
-        self.id = id
-        self.base = base
-        self.log = self.base.log
+    def _init_attributes(self):
         self.charge_enable_time = False
         self.charge_start_time_minutes = self.base.forecast_minutes
         self.charge_start_end_minutes = self.base.forecast_minutes
@@ -446,9 +443,9 @@ class Inverter:
         self.pv_power = 0
         self.load_power = 0
         self.rest_api = None
-
         self.inverter_type = self.base.get_arg("inverter_type", "GE", indirect=False)
 
+    def _init_brand_defs(self):
         # Load inverter brand definitions
         self.reserve_max = self.base.get_arg("inverter_reserve_max", 100)
         self.inv_has_rest_api = INVERTER_DEF[self.inverter_type]["has_rest_api"]
@@ -468,18 +465,99 @@ class Inverter:
 
         # If it's not a GE inverter then turn Quiet off
         if self.inverter_type != "GE":
-            quiet = False
+            self.quiet = False
 
+    def _init_reserve(self):
+        # Get current reserve value
+        if self.rest_data:
+            self.reserve_percent_current = float(self.rest_data["Control"]["Battery_Power_Reserve"])
+        else:
+            self.reserve_percent_current = max(
+                self.base.get_arg("reserve", default=0.0, index=self.id),
+                self.base.get_arg("battery_min_soc", default=4.0, index=self.id),
+            )
+        self.reserve_current = self.base.dp2(self.soc_max * self.reserve_percent_current / 100.0)
+
+        # Get the expected minimum reserve value
+        battery_min_soc = self.base.get_arg("battery_min_soc", default=4.0, index=self.id)
+        self.reserve_min = self.base.get_arg("set_reserve_min", 4.0)
+        if self.reserve_min < battery_min_soc:
+            self.base.log(
+                f"Increasing set_reserve_min from {self.reserve_min}%  to battery_min_soc of {battery_min_soc}%"
+            )
+            self.base.expose_config("set_reserve_min", battery_min_soc)
+            self.reserve_min = battery_min_soc
+
+        self.base.log(f"Reserve min: {self.reserve_min}% Battery_min:{battery_min_soc}%")
+        if self.base.set_reserve_enable:
+            self.reserve_percent = self.reserve_min
+        else:
+            self.reserve_percent = self.reserve_percent_current
+        self.reserve = self.base.dp2(self.soc_max * self.reserve_percent / 100.0)
+
+    def _init_api(self):
         # Rest API for GivEnergy
         if self.inverter_type == "GE":
             self.rest_api = self.base.get_arg("givtcp_rest", None, indirect=False, index=self.id)
             if self.rest_api:
-                if not quiet:
+                if not self.quiet:
                     self.base.log("Inverter {} using Rest API {}".format(self.id, self.rest_api))
                 self.rest_data = self.rest_readData()
 
-        # Battery size, charge and discharge rates
+    def _init_time(self):
         ivtime = None
+        if self.rest_data and ("Invertor_Details" in self.rest_data):
+            idetails = self.rest_data["Invertor_Details"]
+            # Inverter time
+            if "Invertor_Time" in idetails:
+                ivtime = idetails["Invertor_Time"]
+
+        else:
+            ivtime = self.base.get_arg("inverter_time", index=self.id, default=None)
+
+        # Convert inverter time into timestamp
+        if ivtime:
+            try:
+                self.inverter_time = datetime.strptime(ivtime, TIME_FORMAT)
+            except (ValueError, TypeError):
+                try:
+                    self.inverter_time = datetime.strptime(ivtime, TIME_FORMAT_OCTOPUS)
+                except (ValueError, TypeError):
+                    try:
+                        tz = pytz.timezone(self.base.get_arg("timezone", "Europe/London"))
+                        self.inverter_time = tz.localize(datetime.strptime(ivtime, self.inv_clock_time_format))
+                    except (ValueError, TypeError):
+                        self.base.log(
+                            f"Warn: Unable to read inverter time string {ivtime} using formats {[TIME_FORMAT, TIME_FORMAT_OCTOPUS, self.inv_clock_time_format]}"
+                        )
+                        self.inverter_time = None
+
+        # Check inverter time and confirm skew
+        if self.inverter_time:
+            tdiff = self.inverter_time - self.base.now_utc
+            tdiff = self.base.dp2(tdiff.seconds / 60 + tdiff.days * 60 * 24)
+            if not self.quiet:
+                self.base.log(
+                    "Invertor time {} AppDaemon time {} difference {} minutes".format(
+                        self.inverter_time, self.base.now_utc, tdiff
+                    )
+                )
+            if abs(tdiff) >= 5:
+                self.base.log(
+                    "WARN: Invertor time is {} AppDaemon time {} this is {} minutes skewed, Predbat may not function correctly, please fix this by updating your inverter or fixing AppDaemon time zone".format(
+                        self.inverter_time, self.base.now_utc, tdiff
+                    )
+                )
+                self.base.record_status(
+                    "Invertor time is {} AppDaemon time {} this is {} minutes skewed, Predbat may not function correctly, please fix this by updating your inverter or fixing AppDaemon time zone".format(
+                        self.inverter_time, self.base.now_utc, tdiff
+                    ),
+                    had_errors=True,
+                )
+
+    def _init_battery(self):
+        # Battery size, charge and discharge rates
+
         if self.rest_data and ("Invertor_Details" in self.rest_data):
             idetails = self.rest_data["Invertor_Details"]
             self.soc_max = float(idetails["Battery_Capacity_kWh"])
@@ -507,9 +585,6 @@ class Inverter:
             if "Invertor_Max_Inv_Rate" in idetails:
                 self.inverter_limit = idetails["Invertor_Max_Inv_Rate"]
 
-            # Inverter time
-            if "Invertor_Time" in idetails:
-                ivtime = idetails["Invertor_Time"]
         else:
             self.soc_max = self.base.get_arg("soc_max", default=10.0, index=self.id) * self.base.battery_scaling
             self.nominal_capacity = self.soc_max
@@ -604,7 +679,7 @@ class Inverter:
         self.export_limit = min(self.export_limit, self.inverter_limit)
 
         # Log inverter details
-        if not quiet:
+        if not self.quiet:
             self.base.log(
                 "New Inverter {} with soc_max {} kWh nominal_capacity {} kWh battery rate raw {} w charge rate {} kw discharge rate {} kw battery_rate_min {} w ac limit {} kw export limit {} kw reserve {} % current_reserve {} %".format(
                     self.id,
@@ -621,34 +696,35 @@ class Inverter:
                 )
             )
 
+    def _init_dummy_entities(self):
         # Create some dummy entities if PredBat expects them but they don't exist for this Inverter Type:
         # Args are also set for these so that no entries are needed for the dummies in the config file
 
         if not self.inv_has_charge_enable_time:
-            self.base.args["scheduled_charge_enable"] = self.create_entity("scheduled_charge_enable", False)
+            self.base.args["scheduled_charge_enable"] = self._create_entity("scheduled_charge_enable", False)
 
         if not self.inv_has_discharge_enable_time:
-            self.base.args["scheduled_discharge_enable"] = self.create_entity("scheduled_discharge_enable", False)
+            self.base.args["scheduled_discharge_enable"] = self._create_entity("scheduled_discharge_enable", False)
 
         if not self.inv_has_reserve_soc:
-            self.base.args["reserve"] = self.create_entity("reserve", self.reserve, device_class="battery", uom="%")
+            self.base.args["reserve"] = self._create_entity("reserve", self.reserve, device_class="battery", uom="%")
 
         if not self.inv_has_target_soc:
-            self.base.args["charge_limit"] = self.create_entity("charge_limit", 100, device_class="battery", uom="%")
+            self.base.args["charge_limit"] = self._create_entity("charge_limit", 100, device_class="battery", uom="%")
 
         if self.inv_output_charge_control != "power":
-            self.base.args["charge_rate"] = self.create_entity("charge_rate", int(self.battery_rate_max_charge * 60 * 1000), uom="W", device_class="power")
-            self.base.args["discharge_rate"] = self.create_entity("discharge_rate", int(self.battery_rate_max_discharge * 60 * 1000), uom="W", device_class="power")
+            self.base.args["charge_rate"] = self._create_entity("charge_rate", int(self.battery_rate_max_charge * 60 * 1000), uom="W", device_class="power")
+            self.base.args["discharge_rate"] = self._create_entity("discharge_rate", int(self.battery_rate_max_discharge * 60 * 1000), uom="W", device_class="power")
 
         if not self.inv_has_ge_inverter_mode:
-            self.base.args["inverter_mode"] = self.create_entity("inverter_mode", "Eco")
+            self.base.args["inverter_mode"] = self._create_entity("inverter_mode", "Eco")
 
         if self.inv_charge_time_format != "HH:MM:SS":
             for x in ["charge", "discharge"]:
                 for y in ["start", "end"]:
-                    self.base.args[f"{x}_{y}_time"] = self.create_entity(f"{x}_{y}_time", "23:59:00")
+                    self.base.args[f"{x}_{y}_time"] = self._create_entity(f"{x}_{y}_time", "23:59:00")
 
-    def create_entity(self, entity_name, value, uom=None, device_class="None"):
+    def _create_entity(self, entity_name, value, uom=None, device_class="None"):
         """
         Create dummy entities required by non GE inverters to mimic GE behaviour
         """
@@ -672,6 +748,20 @@ class Inverter:
             entity = self.base.get_entity(entity_id)
             entity.set_state(state=value, attributes=attributes)
         return entity_id
+
+    def __init__(self, base, id=0, quiet=False):
+        self.id = id
+        self.base = base
+        self.log = self.base.log
+        self.quiet = quiet
+
+        self._init_attributes()
+        self._init_brand_defs()
+
+        self._init_api()
+        self._init_battery()
+        self._init_reserve()
+        self._init_dummy_entities()
 
     def update_status(self, minutes_now, quiet=False):
         """
