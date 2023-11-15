@@ -1019,6 +1019,33 @@ class Inverter:
         else:
             self.base.log("Inverter {} Current reserve is {} already at target".format(self.id, current_reserve))
 
+    def _adjust_rate(self, new_rate, direction, notify=True):
+        if self.rest_data:
+            current_rate = self.rest_data["Control"][f"Battery_{direction.title()}_Rate"]
+        else:
+            current_rate = self.base.get_arg(f"{direction}_rate", index=self.id, default=2600.0)
+
+        if abs(current_rate - new_rate) > 100:
+            self.base.log(f"Inverter {self.id} current {direction} rate is {current_rate} and new target is {new_rate}")
+
+            if self.rest_api:
+                if direction == "charge":
+                    self._rest_setChargeRate(new_rate)
+                else:
+                    self._rest_setDischargeRate(new_rate)
+
+            else:
+                entity = self.base.get_entity(self.base.get_arg(f"{direction}_rate", indirect=False, index=self.id))
+                # Write
+                self._write_and_poll_value("f{direction}_rate", entity, new_rate, fuzzy=100)
+                if self.inv_output_charge_control == "current":
+                    self._set_current_from_power(direction, new_rate)
+
+            if notify and self.base.set_soc_notify:
+                self.base.call_notify(f"Predbat: Inverter {self.id} {direction} rate changes to {new_rate} at {self.base.time_now_str()}")
+            if notify:
+                self.base.record_status(f"Inverter {self.id} charge rate changed to {new_rate}")
+
     def adjust_charge_rate(self, new_rate, notify=True):
         """
         Adjust charging rate
@@ -1044,30 +1071,9 @@ class Inverter:
 
         if SIMULATE:
             current_rate = self.base.sim_charge_rate_now
+            self.base.sim_charge_rate_now = new_rate
         else:
-            if self.rest_data:
-                current_rate = self.rest_data["Control"]["Battery_Charge_Rate"]
-            else:
-                current_rate = self.base.get_arg("charge_rate", index=self.id, default=2600.0)
-
-        if abs(current_rate - new_rate) > 100:
-            self.base.log("Inverter {} current charge rate is {} and new target is {}".format(self.id, current_rate, new_rate))
-            if SIMULATE:
-                self.base.sim_charge_rate_now = new_rate
-            else:
-                if self.rest_api:
-                    self._rest_setChargeRate(new_rate)
-                else:
-                    entity = self.base.get_entity(self.base.get_arg("charge_rate", indirect=False, index=self.id))
-                    # Write
-                    self._write_and_poll_value("charge_rate", entity, new_rate, fuzzy=100)
-                    if self.inv_output_charge_control == "current":
-                        self._set_current_from_power("charge", new_rate)
-
-                if notify and self.base.set_soc_notify:
-                    self.base.call_notify("Predbat: Inverter {} charge rate changes to {} at {}".format(self.id, new_rate, self.base.time_now_str()))
-            if notify:
-                self.base.record_status("Inverter {} charge rate changed to {}".format(self.id, new_rate))
+            self._adjust_rate(new_rate, "charge", notify=notify)
 
     def adjust_discharge_rate(self, new_rate, notify=True):
         """
@@ -1092,30 +1098,9 @@ class Inverter:
 
         if SIMULATE:
             current_rate = self.base.sim_discharge_rate_now
+            self.base.sim_discharge_rate_now = new_rate
         else:
-            if self.rest_data:
-                current_rate = self.rest_data["Control"]["Battery_Discharge_Rate"]
-            else:
-                current_rate = self.base.get_arg("discharge_rate", index=self.id, default=2600.0)
-
-        if abs(current_rate - new_rate) > 100:
-            self.base.log("Inverter {} current discharge rate is {} and new target is {}".format(self.id, current_rate, new_rate))
-            if SIMULATE:
-                self.base.sim_discharge_rate_now = new_rate
-            else:
-                if self.rest_api:
-                    self._rest_setDischargeRate(new_rate)
-                else:
-                    entity = self.base.get_entity(self.base.get_arg("discharge_rate", indirect=False, index=self.id))
-                    self._write_and_poll_value("discharge_rate", entity, new_rate, fuzzy=100)
-
-                    if self.inv_output_charge_control == "current":
-                        self._set_current_from_power("discharge", new_rate)
-
-                if notify and self.base.set_discharge_notify:
-                    self.base.call_notify("Predbat: Inverter {} discharge rate changes to {} at {}".format(self.id, new_rate, self.base.time_now_str()))
-            if notify:
-                self.base.record_status("Inverter {} discharge rate changed to {}".format(self.id, new_rate))
+            self._adjust_rate(new_rate, "discharge", notify=notify)
 
     def adjust_battery_target(self, soc):
         """
