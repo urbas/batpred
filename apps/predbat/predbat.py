@@ -447,7 +447,9 @@ class Inverter:
         self.load_power = 0
         self.rest_api = None
 
-        self.inverter_type = self.base.get_arg("inverter_type", "GE", indirect=False)
+        # If it's not a GE inverter then turn Quiet off
+        if self.inverter_type != "GE":
+            quiet = False
 
         # Load inverter brand definitions
         self.reserve_max = self.base.get_arg("inverter_reserve_max", 100)
